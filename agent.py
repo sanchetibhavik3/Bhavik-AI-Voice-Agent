@@ -249,6 +249,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 )
                 await _log("info", f"Call answered: {phone_number}")
             except Exception as exc:
+                logger.error(f"Dial failed FULL ERROR: {exc}", exc_info=True)
                 await _log("error", f"Dial failed for {phone_number}", str(exc))
                 return
 
