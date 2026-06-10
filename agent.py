@@ -136,7 +136,11 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
         except Exception as e:
             logger.warning("Silence-prevention config skipped: %s", e)
 
-        kw: dict = dict(model=gemini_model, voice=gemini_voice, instructions=system_prompt)
+        # initial_message triggers agent to speak FIRST on connect
+        # without this, Gemini Live waits for human to speak first
+        _lead = system_prompt.split("speaking with ")[1].split("?")[0].strip() if "speaking with " in system_prompt else "there"
+        _greeting = f"Hi, am I speaking with {_lead}?"
+        kw: dict = dict(model=gemini_model, voice=gemini_voice, instructions=system_prompt, initial_message=_greeting)
         if _rt:
             kw["realtime_input_config"]      = _rt
             kw["session_resumption"]         = _sr
@@ -280,21 +284,15 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 await _log("warning", f"No answer: {phone_number}")
                 return
 
-            # Wait for either side to end the call
-            await asyncio.wait(
-                [
-                    asyncio.ensure_future(sip_hungup.wait()),
-                    asyncio.ensure_future(room_closed.wait()),
-                ],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            # Wait ONLY for SIP hangup — don't kill session on room events
+            # room_closed is used as a safety fallback only
+            await sip_hungup.wait()
+            logger.info("✅ SIP ended, cleaning up: %s", phone_number)
 
             try:
                 await ctx.room.disconnect()
             except Exception:
                 pass
-
-            logger.info("✅ Call done: %s", phone_number)
             return
 
     # No phone — just keep alive until room closes
