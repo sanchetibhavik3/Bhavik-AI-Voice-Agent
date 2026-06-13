@@ -55,6 +55,21 @@ try:
 except Exception:
     pass
 
+# Pre-warm Gemini WS at worker startup — eliminates 2-4s handshake per call
+_warm_session: "AgentSession | None" = None
+
+def _prewarm(proc: agents.JobProcess) -> None:
+    global _warm_session
+    try:
+        from prompts import DEFAULT_SYSTEM_PROMPT
+        dummy_prompt = DEFAULT_SYSTEM_PROMPT.format(
+            lead_name="there", business_name="our company", service_type="our service"
+        )
+        _warm_session = _build_session([], dummy_prompt)
+        logger.info("✅ Gemini WS pre-warmed at worker startup")
+    except Exception as e:
+        logger.warning("Pre-warm failed: %s", e)
+
 
 async def _log(level: str, msg: str, detail: str = "") -> None:
     try:
@@ -136,11 +151,7 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
         except Exception as e:
             logger.warning("Silence-prevention config skipped: %s", e)
 
-        # initial_message triggers agent to speak FIRST on connect
-        # without this, Gemini Live waits for human to speak first
-        _lead = system_prompt.split("speaking with ")[1].split("?")[0].strip() if "speaking with " in system_prompt else "there"
-        _greeting = f"Hi, am I speaking with {_lead}?"
-        kw: dict = dict(model=gemini_model, voice=gemini_voice, instructions=system_prompt, initial_message=_greeting)
+        kw: dict = dict(model=gemini_model, voice=gemini_voice, instructions=system_prompt)
         if _rt:
             kw["realtime_input_config"]      = _rt
             kw["session_resumption"]         = _sr
@@ -152,7 +163,7 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
         raise RuntimeError("No Google AI backend available.")
 
     logger.info("🎙  Pipeline mode | Deepgram + Gemini + Google TTS")
-    stt = _deepgram_stt(model="nova-3", language="multi") if _deepgram_stt else None
+    stt = _deepgram_stt(model="nova-2-phonecall") if _deepgram_stt else None
     tts = _google_tts() if _google_tts else None
     vad = silero.VAD.load()
     return AgentSession(stt=stt, llm=_google_llm(model=gemini_model), tts=tts, vad=vad, tools=tools)
@@ -279,6 +290,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 # 300ms buffer — audio path fully open, agent speaks instantly
                 await asyncio.sleep(0.3)
                 logger.info("🗣  Agent speaking…")
+                await session.say(f"Hi, am I speaking with {lead_name}?")
             except asyncio.TimeoutError:
                 logger.warning("⏱  No answer: %s", phone_number)
                 await _log("warning", f"No answer: {phone_number}")
@@ -311,6 +323,7 @@ if __name__ == "__main__":
     agents.cli.run_app(
         agents.WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=_prewarm,
             agent_name="outbound-caller",
         )
     )
