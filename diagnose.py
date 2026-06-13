@@ -395,32 +395,25 @@ async def check_gemini():
         return FAIL
 
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        import asyncio
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: genai.GenerativeModel("gemini-2.0-flash").generate_content("Say OK")
-        )
-        if response.text:
-            ok(f"Gemini API works — response: '{response.text.strip()[:40]}'")
+        import google.genai as genai
+        client = genai.Client(api_key=api_key)
+        # Check which live models are available
+        live_models = []
+        for m in client.models.list():
+            actions = [str(a) for a in getattr(m, 'supported_actions', [])]
+            if any('bidi' in a.lower() or 'live' in a.lower() for a in actions):
+                live_models.append(m.name.replace('models/', ''))
+        if live_models:
+            ok(f"Gemini API works — Live models available: {', '.join(live_models[:2])}")
             record("GEMINI", PASS)
             return PASS
         else:
-            err("Gemini returned empty response")
-            record("GEMINI", FAIL, "Empty response")
+            err("No Gemini Live models found for this API key")
+            record("GEMINI", FAIL, "No live models")
             return FAIL
     except Exception as e:
         err_str = str(e)
-        if "API_KEY_INVALID" in err_str or "invalid" in err_str.lower():
-            err(f"Gemini API key is INVALID")
-            inf("→ Check GOOGLE_API_KEY at https://aistudio.google.com/app/apikey")
-        elif "quota" in err_str.lower():
-            err(f"Gemini API quota exceeded")
-            inf("→ Check quota at https://console.cloud.google.com/")
-        else:
-            err(f"Gemini check failed: {e}")
+        err(f"Gemini check failed: {e}")
         record("GEMINI", FAIL, err_str[:100])
         return FAIL
 
