@@ -39,6 +39,7 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger("agent")
 
 # ── NC model cached at module level — loaded ONCE when worker starts ──────────
+# This means zero NC load time per call
 _NC_MODEL: Optional[noise_cancellation.BVCTelephony] = None
 
 def _get_nc() -> noise_cancellation.BVCTelephony:
@@ -48,28 +49,11 @@ def _get_nc() -> noise_cancellation.BVCTelephony:
         logger.info("✅ NC model cached")
     return _NC_MODEL
 
+# Pre-load NC at import time so it's ready before any call arrives
 try:
     _get_nc()
 except Exception:
     pass
-
-<<<<<<< HEAD
-# Pre-warm Gemini WS at worker startup — eliminates 2-4s handshake per call
-=======
->>>>>>> 51c835a (fix: resolve outbound call issues)
-_warm_session: "AgentSession | None" = None
-
-def _prewarm(proc: agents.JobProcess) -> None:
-    global _warm_session
-    try:
-        from prompts import DEFAULT_SYSTEM_PROMPT
-        dummy_prompt = DEFAULT_SYSTEM_PROMPT.format(
-            lead_name="there", business_name="our company", service_type="our service"
-        )
-        _warm_session = _build_session([], dummy_prompt)
-        logger.info("✅ Gemini WS pre-warmed at worker startup")
-    except Exception as e:
-        logger.warning("Pre-warm failed: %s", e)
 
 
 async def _log(level: str, msg: str, detail: str = "") -> None:
@@ -127,13 +111,7 @@ except ImportError:
 
 
 def _build_session(tools: list, system_prompt: str) -> AgentSession:
-    # FIX: use gemini-2.0-flash-live-001 as default (gemini-2.0-flash is deprecated)
-    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-live-001")
-    # Safety: if someone has the old broken model in env, auto-correct it
-    if gemini_model in ("gemini-2.0-flash", "gemini-3.1-flash-live-preview"):
-        logger.warning("⚠️  Model '%s' is deprecated — switching to gemini-2.0-flash-live-001", gemini_model)
-        gemini_model = "gemini-2.0-flash-live-001"
-
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
     gemini_voice = os.getenv("GEMINI_TTS_VOICE", "Aoede")
     use_realtime = os.getenv("USE_GEMINI_REALTIME", "true").lower() != "false"
     RealtimeClass = _google_realtime or (_google_beta_realtime if use_realtime else None)
@@ -141,7 +119,6 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
     if use_realtime and RealtimeClass is not None:
         logger.info("🎙  Gemini Live | model=%s voice=%s", gemini_model, gemini_voice)
         _rt = _sr = _cw = None
-<<<<<<< HEAD
         try:
             from google.genai import types as _gt
             _rt = _gt.RealtimeInputConfig(
@@ -159,14 +136,15 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
         except Exception as e:
             logger.warning("Silence-prevention config skipped: %s", e)
 
-        kw: dict = dict(model=gemini_model, voice=gemini_voice, instructions=system_prompt)
+        # initial_message triggers agent to speak FIRST on connect
+        # without this, Gemini Live waits for human to speak first
+        _lead = system_prompt.split("speaking with ")[1].split("?")[0].strip() if "speaking with " in system_prompt else "there"
+        _greeting = f"Hi, am I speaking with {_lead}?"
+        kw: dict = dict(model=gemini_model, voice=gemini_voice, instructions=system_prompt, initial_message=_greeting)
         if _rt:
             kw["realtime_input_config"]      = _rt
             kw["session_resumption"]         = _sr
             kw["context_window_compression"] = _cw
-=======
-        kw: dict = dict(model=gemini_model, voice=gemini_voice, instructions=system_prompt)
->>>>>>> 51c835a (fix: resolve outbound call issues)
 
         return AgentSession(llm=RealtimeClass(**kw), tools=tools)
 
@@ -174,7 +152,7 @@ def _build_session(tools: list, system_prompt: str) -> AgentSession:
         raise RuntimeError("No Google AI backend available.")
 
     logger.info("🎙  Pipeline mode | Deepgram + Gemini + Google TTS")
-    stt = _deepgram_stt(model="nova-2-phonecall") if _deepgram_stt else None
+    stt = _deepgram_stt(model="nova-3", language="multi") if _deepgram_stt else None
     tts = _google_tts() if _google_tts else None
     vad = silero.VAD.load()
     return AgentSession(stt=stt, llm=_google_llm(model=gemini_model), tts=tts, vad=vad, tools=tools)
@@ -204,7 +182,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     logger.info("📞 Job | phone=%s lead=%s", phone_number, lead_name)
 
-    # ── Load profile + build prompt ───────────────────────────────────────────
+    # ── STEP 1: Load profile + build prompt (no network blocking ops) ─────────
     profile_tools = []
     if agent_profile_id:
         try:
@@ -220,13 +198,13 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     system_prompt = build_prompt(lead_name, business_name, service_type, custom_prompt)
     enabled_tools = profile_tools or await get_enabled_tools()
 
-    # ── Connect to room ───────────────────────────────────────────────────────
+    # ── STEP 2: Connect to room ───────────────────────────────────────────────
     await ctx.connect()
 
     tool_ctx = AppointmentTools(ctx, phone_number, lead_name)
     tools    = tool_ctx.build_tool_list(enabled_tools)
 
-    # ── Build + start session ─────────────────────────────────────────────────
+    # ── STEP 3: Build + start session (Gemini WS handshake happens here) ──────
     session = _build_session(tools, system_prompt)
 
     class _Agent(Agent):
@@ -249,7 +227,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     logger.info("✅ Session ready — dialling now")
 
-    # ── Dial out ──────────────────────────────────────────────────────────────
+    # ── STEP 4: NOW dial — agent is 100% ready before phone rings ────────────
     if phone_number:
         user_present = any(
             "sip_" in p.identity or phone_number.replace("+", "") in p.identity
@@ -266,54 +244,27 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             sip_hungup  = asyncio.Event()
             room_closed = asyncio.Event()
 
-            # FIX: track the SPECIFIC SIP participant identity we dialled
-            # so we don't fire hangup when OTHER internal participants disconnect
-            sip_participant_identity: Optional[str] = None
-            expected_identity = f"sip_{phone_number.replace('+', '')}"
-
             @ctx.room.on("participant_connected")
-            def _on_connect(p):
-                nonlocal sip_participant_identity
-                logger.info("👤 Participant connected: %s", p.identity)
-                # Only treat it as "answered" if it's the SIP participant we dialled
-                if (
-                    p.identity == expected_identity
-                    or "sip_" in p.identity
-                    or phone_number.replace("+", "") in p.identity
-                ):
-                    sip_participant_identity = p.identity
-                    logger.info("📲 SIP answered: %s → identity=%s", phone_number, p.identity)
-                    answered.set()
+            def _on_answer(_p):
+                logger.info("📲 Answered: %s", phone_number)
+                answered.set()
 
             @ctx.room.on("participant_disconnected")
-            def _on_disconnect(p):
-                logger.info("👤 Participant disconnected: %s", p.identity)
-                # FIX: only fire hangup if it's the SIP participant we're tracking
-                # Ignore internal/agent participants disconnecting during setup
-                if sip_participant_identity and p.identity == sip_participant_identity:
-                    logger.info("📴 SIP hangup confirmed: %s", phone_number)
-                    sip_hungup.set()
-                elif "sip_" in p.identity or phone_number.replace("+", "") in p.identity:
-                    logger.info("📴 SIP hangup (by pattern): %s", p.identity)
-                    sip_hungup.set()
-                else:
-                    logger.info("ℹ️  Non-SIP participant left (ignored): %s", p.identity)
+            def _on_hangup(_p):
+                logger.info("📴 Hangup: %s", phone_number)
+                sip_hungup.set()
 
             @ctx.room.on("disconnected")
             def _on_room_close(*_):
-                logger.info("🚪 Room closed")
                 room_closed.set()
-                # Also unblock sip_hungup so we don't hang forever
-                sip_hungup.set()
 
-            # Dial
             try:
                 await ctx.api.sip.create_sip_participant(
                     api.CreateSIPParticipantRequest(
                         room_name=ctx.room.name,
                         sip_trunk_id=trunk_id,
                         sip_call_to=phone_number,
-                        participant_identity=expected_identity,
+                        participant_identity=f"sip_{phone_number.replace('+', '')}",
                         wait_until_answered=False,
                     )
                 )
@@ -323,33 +274,20 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 await _log("error", f"Dial failed for {phone_number}", str(exc))
                 return
 
-            # Wait for answer (45s timeout)
             try:
                 await asyncio.wait_for(answered.wait(), timeout=45.0)
-                # 300ms buffer — audio path fully open before agent speaks
+                # 300ms buffer — audio path fully open, agent speaks instantly
                 await asyncio.sleep(0.3)
-<<<<<<< HEAD
                 logger.info("🗣  Agent speaking…")
-                await session.say(f"Hi, am I speaking with {lead_name}?")
-=======
-                logger.info("🗣  Agent is live — Gemini will speak from system prompt")
-                # Native audio model speaks automatically from system prompt instructions
-                # session.say() is not supported — Gemini Live handles audio natively
->>>>>>> 51c835a (fix: resolve outbound call issues)
             except asyncio.TimeoutError:
-                logger.warning("⏱  No answer after 45s: %s", phone_number)
+                logger.warning("⏱  No answer: %s", phone_number)
                 await _log("warning", f"No answer: {phone_number}")
-                # Log the outcome
-                try:
-                    await tool_ctx.end_call(outcome="no_answer", reason="no answer after 45s")
-                except Exception:
-                    pass
                 return
 
-            # Wait for the SIP call to end (human hangs up or agent calls end_call)
-            logger.info("⏳ Waiting for call to end: %s", phone_number)
+            # Wait ONLY for SIP hangup — don't kill session on room events
+            # room_closed is used as a safety fallback only
             await sip_hungup.wait()
-            logger.info("✅ SIP call ended, cleaning up: %s", phone_number)
+            logger.info("✅ SIP ended, cleaning up: %s", phone_number)
 
             try:
                 await ctx.room.disconnect()
@@ -357,7 +295,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 pass
             return
 
-    # No phone number — keep alive until room closes
+    # No phone — just keep alive until room closes
     done = asyncio.Event()
 
     @ctx.room.on("disconnected")
@@ -373,7 +311,6 @@ if __name__ == "__main__":
     agents.cli.run_app(
         agents.WorkerOptions(
             entrypoint_fnc=entrypoint,
-            prewarm_fnc=_prewarm,
             agent_name="outbound-caller",
         )
     )
